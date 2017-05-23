@@ -231,11 +231,23 @@ public class Chapter05 {
         logRecent(conn, name, message, INFO);
     }
 
+    /**
+     * 记录最新日志
+     * @param conn
+     * @param name
+     * @param message
+     * @param severity 日志级别
+     */
     public void logRecent(Jedis conn, String name, String message, String severity) {
+        //  构造日志表 key
         String destination = "recent:" + name + ':' + severity;
+        // 开启流水线
         Pipeline pipe = conn.pipelined();
+        // 将消息内容和时间从左端放入日志列表中
         pipe.lpush(destination, TIMESTAMP.format(new Date()) + ' ' + message);
+        // 修剪日志列表，使其只包含最新的100条消息记录
         pipe.ltrim(destination, 0, 99);
+        // 执行上面两个指令
         pipe.sync();
     }
 
@@ -245,8 +257,11 @@ public class Chapter05 {
 
     public void logCommon(
             Jedis conn, String name, String message, String severity, int timeout) {
+        // 构造存储近期日志消息 key
         String commonDest = "common:" + name + ':' + severity;
+        //
         String startKey = commonDest + ":start";
+
         long end = System.currentTimeMillis() + timeout;
         while (System.currentTimeMillis() < end){
             conn.watch(startKey);
@@ -283,9 +298,13 @@ public class Chapter05 {
     public void updateCounter(Jedis conn, String name, int count, long now){
         Transaction trans = conn.multi();
         for (int prec : PRECISION) {
-            long pnow = (now / prec) * prec;
+            // 获取当前时间片的开始时间 long（now/prec）忽略余数再乘以prec
+            // 使得最终结果为某个频率下的某个时间片的开始时间
+            long pnow = long(now / prec) * prec;
             String hash = String.valueOf(prec) + ':' + name;
+            // 将计数器名称添加到有序集合
             trans.zadd("known:", 0, hash);
+            // 更新计数器 特定频率下的时间戳
             trans.hincrBy("count:" + hash, String.valueOf(pnow), count);
         }
         trans.exec();
@@ -294,15 +313,19 @@ public class Chapter05 {
     public List<Pair<Integer,Integer>> getCounter(
         Jedis conn, String name, int precision)
     {
+        // 构造某个频率计数器 key
         String hash = String.valueOf(precision) + ':' + name;
+        // 获取所有数据
         Map<String,String> data = conn.hgetAll("count:" + hash);
         ArrayList<Pair<Integer,Integer>> results =
             new ArrayList<Pair<Integer,Integer>>();
+        // 将字符串转化成int类型
         for (Map.Entry<String,String> entry : data.entrySet()) {
             results.add(new Pair<Integer,Integer>(
                         Integer.parseInt(entry.getKey()),
                         Integer.parseInt(entry.getValue())));
         }
+        // 排序
         Collections.sort(results);
         return results;
     }
@@ -553,14 +576,26 @@ public class Chapter05 {
             while (!quit){
                 long start = System.currentTimeMillis() + timeOffset;
                 int index = 0;
+                /**
+                 * 1.为什么不使用提前获取zcard然后使用for循环的方式，减少多次查询有序集合个数的情况？
+                 *   因为在清理的过程成可能会有新的计数器添加进来，也就是说计数器有序集合的大小是动态改变的
+                 */
                 while (index < conn.zcard("known:")){
+                    // 获取偏移量为index的计数器的记录
                     Set<String> hashSet = conn.zrange("known:", index, index);
+                    // 移动偏移量
                     index++;
                     if (hashSet.size() == 0) {
                         break;
                     }
+                    // 获取该计数器的名称
                     String hash = hashSet.iterator().next();
+                    // 获取计数器的精度
                     int prec = Integer.parseInt(hash.substring(0, hash.indexOf(':')));
+
+                    /**
+                     * 清理频率？？？
+                     */
                     int bprec = (int)Math.floor(prec / 60);
                     if (bprec == 0){
                         bprec = 1;
@@ -569,21 +604,32 @@ public class Chapter05 {
                         continue;
                     }
 
+                    // 构造某个频率计数器 key
                     String hkey = "count:" + hash;
+                    // 获取要移除的时间戳的最大值
                     String cutoff = String.valueOf(
                         ((System.currentTimeMillis() + timeOffset) / 1000) - sampleCount * prec);
+                    // 获取某频率计数器里所有的时间戳
                     ArrayList<String> samples = new ArrayList<String>(conn.hkeys(hkey));
                     Collections.sort(samples);
+                    // 计算出要移除的数量
                     int remove = bisectRight(samples, cutoff);
 
                     if (remove != 0){
                         conn.hdel(hkey, samples.subList(0, remove).toArray(new String[0]));
+                        // 计数器内的数据 可能 被全部清空
                         if (remove == samples.size()){
+                            // 监视该key
                             conn.watch(hkey);
+                            // 已经被清空
                             if (conn.hlen(hkey) == 0) {
+                                // 开启事务
                                 Transaction trans = conn.multi();
+                                // 将该计数器从有序集合中移除
                                 trans.zrem("known:", hash);
+                                // 执行事务
                                 trans.exec();
+                                // 偏移量下标--，因为有序集合的个数发生了变化
                                 index--;
                             }else{
                                 conn.unwatch();
@@ -591,7 +637,7 @@ public class Chapter05 {
                         }
                     }
                 }
-
+                // 执行完一次清理 passes计数器++
                 passes++;
                 long duration = Math.min(
                     (System.currentTimeMillis() + timeOffset) - start + 1000, 60000);

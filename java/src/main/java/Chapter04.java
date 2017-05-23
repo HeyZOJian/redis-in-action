@@ -8,6 +8,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+/**
+ * 游戏中的商品买卖市场
+ */
 public class Chapter04 {
     public static final void main(String[] args) {
         new Chapter04().run();
@@ -94,58 +97,105 @@ public class Chapter04 {
         benchmarkUpdateToken(conn, 5);
     }
 
+    /**
+     * 将用户包裹中的商品添加到买卖市场
+     * @param conn redis连接
+     * @param itemId 商品ID
+     * @param sellerId 用户ID
+     * @param price 商品价格
+     * @return
+     */
     public boolean listItem(
             Jedis conn, String itemId, String sellerId, double price) {
 
+        // 构造用户包裹键值
         String inventory = "inventory:" + sellerId;
+        // 构造买卖市场有序集合中的成员（即商品在买卖市场中的ID）
         String item = itemId + '.' + sellerId;
         long end = System.currentTimeMillis() + 5000;
 
+        // 5秒内无限重试
         while (System.currentTimeMillis() < end) {
+            // WATCH 监视 inventory这个键值的任何变化
             conn.watch(inventory);
+            // 判断当前包裹中是否还含有该商品
             if (!conn.sismember(inventory, itemId)){
+                // 对连接进行重置，取消 WATCH 命令对所有 键值 的监视
                 conn.unwatch();
                 return false;
             }
-
+            // 执行MULTI指令 开始 事务
             Transaction trans = conn.multi();
+
+            // 将商品ID和价格添加到买卖市场的有序集合中
             trans.zadd("market:", price, item);
+
+            // 将商品从用户的包裹中移除
             trans.srem(inventory, itemId);
+
+            // 执行EXEC指令 执行 事务
             List<Object> results = trans.exec();
+            // 返回null说明WATCH的某个键值发生了改变，事务执行失败（即用户包裹发生变化）
             // null response indicates that the transaction was aborted due to
             // the watched key changing.
             if (results == null){
+                // 事务重试
                 continue;
             }
             return true;
         }
+        // 重试超时 ，放弃操作
         return false;
     }
 
+    /**
+     * 购买商品
+     * @param conn
+     * @param buyerId
+     * @param itemId
+     * @param sellerId
+     * @param lprice
+     * @return
+     */
     public boolean purchaseItem(
             Jedis conn, String buyerId, String itemId, String sellerId, double lprice) {
-
+        // 构造买方用户 key
         String buyer = "users:" + buyerId;
+        // 构造卖方用户 key
         String seller = "users:" + sellerId;
+        // 构造买卖市场（有序集合）中成员--商品
         String item = itemId + '.' + sellerId;
+        // 构造买方用户包裹 key
         String inventory = "inventory:" + buyerId;
         long end = System.currentTimeMillis() + 10000;
-
+        // 10秒内可重试
         while (System.currentTimeMillis() < end){
+            // 监视 买卖市场、买方的任何变化
             conn.watch("market:", buyer);
-
+            // 获取商品价格
             double price = conn.zscore("market:", item);
+            // 获取买方所持有的金钱
             double funds = Double.parseDouble(conn.hget(buyer, "funds"));
+
             if (price != lprice || price > funds){
+                // 价格发生了变化 或者 买方不够钱购买
+                // 清除监视
                 conn.unwatch();
+
                 return false;
             }
 
+            // 开始事务型流水线
             Transaction trans = conn.multi();
+            // 1.增加卖方所持有的金钱数
             trans.hincrBy(seller, "funds", (int)price);
+            // 2.减少买方所持有的金钱数
             trans.hincrBy(buyer, "funds", (int)-price);
+            // 3.将商品添加到买方的包裹中
             trans.sadd(inventory, itemId);
+            // 4.将商品从买卖市场中移除
             trans.zrem("market:", item);
+            // 执行事务
             List<Object> results = trans.exec();
             // null response indicates that the transaction was aborted due to
             // the watched key changing.
@@ -187,6 +237,13 @@ public class Chapter04 {
         }
     }
 
+    /**
+     * 普通版更新token（一次只发一条命令，可能发2-5条）
+     * @param conn
+     * @param token
+     * @param user
+     * @param item
+     */
     public void updateToken(Jedis conn, String token, String user, String item) {
         long timestamp = System.currentTimeMillis() / 1000;
         conn.hset("login:", token, user);
@@ -198,9 +255,18 @@ public class Chapter04 {
         }
     }
 
+    /**
+     * 使用 非事务型流水线 更新token（将多条命令汇集之后一次性发给redis服务器，减少与redis服务器的通信往返次数）
+     * @param conn
+     * @param token
+     * @param user
+     * @param item
+     */
     public void updateTokenPipeline(Jedis conn, String token, String user, String item) {
         long timestamp = System.currentTimeMillis() / 1000;
+        // 开启流水线
         Pipeline pipe = conn.pipelined();
+        // 开始非事务型流水线
         pipe.multi();
         pipe.hset("login:", token, user);
         pipe.zadd("recent:", timestamp, token);
@@ -209,6 +275,7 @@ public class Chapter04 {
             pipe.zremrangeByRank("viewed:" + token, 0, -26);
             pipe.zincrby("viewed:", -1, item);
         }
+        // 执行非事务性流水线
         pipe.exec();
     }
 }
