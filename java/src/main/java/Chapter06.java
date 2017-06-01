@@ -5,8 +5,6 @@ import redis.clients.jedis.Transaction;
 import redis.clients.jedis.Tuple;
 import redis.clients.jedis.ZParams;
 
-import java.io.*;
-import java.util.*;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
@@ -665,26 +663,48 @@ public class Chapter06 {
         return (Long)results.get(results.size() - 1) == 1;
     }
 
+    /**
+     * 添加延迟任务
+     * @param conn
+     * @param queue 任务队列名字
+     * @param name 处理任务的回调函数的名字
+     * @param args 回调函数参数列表
+     * @param delay 延迟执行的时间
+     * @return
+     */
     public String executeLater(
         Jedis conn, String queue, String name, List<String> args, long delay)
     {
         Gson gson = new Gson();
         String identifier = UUID.randomUUID().toString();
         String itemArgs = gson.toJson(args);
+        // 构造json数据
         String item = gson.toJson(new String[]{identifier, queue, name, itemArgs});
         if (delay > 0){
+            // 添加到延迟队列有序集合中，并设置分值为延迟的时间
             conn.zadd("delayed:", System.currentTimeMillis() + delay, item);
         } else {
+            // 立即添加到任务队列中
             conn.rpush("queue:" + queue, item);
         }
         return identifier;
     }
 
     public String createChat(Jedis conn, String sender, Set<String> recipients, String message) {
+        // 通过全局计数器自增获取新群组的ID
         String chatId = String.valueOf(conn.incr("ids:chat:"));
         return createChat(conn, sender, recipients, message, chatId);
     }
 
+    /**
+     * 创建群组
+     * @param conn
+     * @param sender
+     * @param recipients
+     * @param message
+     * @param chatId
+     * @return
+     */
     public String createChat(
         Jedis conn, String sender, Set<String> recipients, String message, String chatId)
     {
@@ -692,27 +712,41 @@ public class Chapter06 {
 
         Transaction trans = conn.multi();
         for (String recipient : recipients){
+            // 将参与群聊的用户添加到群组有序集合中
             trans.zadd("chat:" + chatId, 0, recipient);
+            // 将群组ID添加进用户的已读有序集合中
             trans.zadd("seen:" + recipient, 0, chatId);
         }
         trans.exec();
-
+        // 发送一条初始化消息
         return sendMessage(conn, chatId, sender, message);
     }
 
+    /**
+     * 向群组发送消息
+     * @param conn
+     * @param chatId
+     * @param sender
+     * @param message
+     * @return
+     */
     public String sendMessage(Jedis conn, String chatId, String sender, String message) {
+        // 对群组加锁
         String identifier = acquireLock(conn, "chat:" + chatId);
         if (identifier == null){
             throw new RuntimeException("Couldn't get the lock");
         }
         try {
+            // 更新消息计数器的值（这是一个竞争条件）
             long messageId = conn.incr("ids:" + chatId);
+            // 构造消息json
             HashMap<String,Object> values = new HashMap<String,Object>();
             values.put("id", messageId);
             values.put("ts", System.currentTimeMillis());
             values.put("sender", sender);
             values.put("message", message);
             String packed = new Gson().toJson(values);
+            // 将消息添加进消息有序集合中，成员为json数据，分值为消息ID
             conn.zadd("msgs:" + chatId, messageId, packed);
         }finally{
             releaseLock(conn, "chat:" + chatId, identifier);
@@ -722,24 +756,33 @@ public class Chapter06 {
 
     @SuppressWarnings("unchecked")
     public List<ChatMessages> fetchPendingMessages(Jedis conn, String recipient) {
+        // 获取用户所加入的群组ID和已读消息ID
         Set<Tuple> seenSet = conn.zrangeWithScores("seen:" + recipient, 0, -1);
         List<Tuple> seenList = new ArrayList<Tuple>(seenSet);
 
         Transaction trans = conn.multi();
         for (Tuple tuple : seenList){
+            // 群组ID
             String chatId = tuple.getElement();
+            // 已读消息ID
             int seenId = (int)tuple.getScore();
             trans.zrangeByScore("msgs:" + chatId, String.valueOf(seenId + 1), "inf");
         }
+        // 获取所有群组的未读消息
         List<Object> results = trans.exec();
 
         Gson gson = new Gson();
+        // 群组ID迭代器
         Iterator<Tuple> seenIterator = seenList.iterator();
+        // 未读消息ID迭代器
         Iterator<Object> resultsIterator = results.iterator();
 
         List<ChatMessages> chatMessages = new ArrayList<ChatMessages>();
+        // 保存更新后的用户群组有序集合已读消息的值
         List<Object[]> seenUpdates = new ArrayList<Object[]>();
+        // 保存已经被所有人读取 需要删除的消息
         List<Object[]> msgRemoves = new ArrayList<Object[]>();
+        // 获取每个群组中的未读消息
         while (seenIterator.hasNext()){
             Tuple seen = seenIterator.next();
             Set<String> messageStrings = (Set<String>)resultsIterator.next();
@@ -749,6 +792,7 @@ public class Chapter06 {
 
             int seenId = 0;
             String chatId = seen.getElement();
+            // 解析json消息
             List<Map<String,Object>> messages = new ArrayList<Map<String,Object>>();
             for (String messageJson : messageStrings){
                 Map<String,Object> message = (Map<String,Object>)gson.fromJson(
@@ -760,7 +804,7 @@ public class Chapter06 {
                 message.put("id", messageId);
                 messages.add(message);
             }
-
+            // 更新群组有序集合中用户已读消息的值
             conn.zadd("chat:" + chatId, seenId, recipient);
             seenUpdates.add(new Object[]{"seen:" + recipient, seenId, chatId});
 
@@ -925,9 +969,11 @@ public class Chapter06 {
 
         public void run() {
             while (!quit){
+                // 获取延迟队列有序集合中的第一个元素
                 Set<Tuple> items = conn.zrangeWithScores("delayed:", 0, 0);
                 Tuple item = items.size() > 0 ? items.iterator().next() : null;
                 if (item == null || item.getScore() > System.currentTimeMillis()) {
+                    // 队列中没有任务或者任务的执行时间尚未来临，则休眠一会
                     try{
                         sleep(10);
                     }catch(InterruptedException ie){
@@ -935,21 +981,22 @@ public class Chapter06 {
                     }
                     continue;
                 }
-
+                // 解析json
                 String json = item.getElement();
                 String[] values = gson.fromJson(json, String[].class);
                 String identifier = values[0];
                 String queue = values[1];
-
+                // 对该延迟任务加锁
                 String locked = acquireLock(conn, identifier);
                 if (locked == null){
                     continue;
                 }
-
+                // 1.将任务从延迟队列中删除
+                // 2.将任务添加进任务队列中
                 if (conn.zrem("delayed:", json) == 1){
                     conn.rpush("queue:" + queue, json);
                 }
-
+                // 解锁
                 releaseLock(conn, identifier, locked);
             }
         }
