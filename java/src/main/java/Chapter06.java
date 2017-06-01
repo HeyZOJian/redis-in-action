@@ -330,32 +330,69 @@ public class Chapter06 {
         }
     }
 
+    /**
+     * 添加最近联系人
+     * @param conn
+     * @param user
+     * @param contact
+     */
     public void addUpdateContact(Jedis conn, String user, String contact) {
+        // 构造用户最近联系人 key
         String acList = "recent:" + user;
         Transaction trans = conn.multi();
+        // 将该联系人从最近联系人中移除
         trans.lrem(acList, 0, contact);
+        // 将该联系人压入最近联系人中的第一个
         trans.lpush(acList, contact);
+        // 修剪最近联系人的大小 只保存前100个
         trans.ltrim(acList, 0, 99);
         trans.exec();
     }
 
+    /**
+     * 将指定联系人从联系人列表里移除
+     * @param conn
+     * @param user
+     * @param contact
+     */
     public void removeContact(Jedis conn, String user, String contact) {
+        /**
+         * 这个0是啥？
+         * LREM KEY COUNT VALUE
+         * 删除value 删剩下count个
+         */
         conn.lrem("recent:" + user, 0, contact);
     }
 
+    /**
+     * 获取最近联系人自动补全列表
+     * @param conn
+     * @param user 用户ID
+     * @param prefix 用户输入的联系人前缀
+     * @return
+     */
     public List<String> fetchAutocompleteList(Jedis conn, String user, String prefix) {
+        // 获取该用户的最近联系人
         List<String> candidates = conn.lrange("recent:" + user, 0, -1);
         List<String> matches = new ArrayList<String>();
+        // 匹配用户输入的前缀
         for (String candidate : candidates) {
             if (candidate.toLowerCase().startsWith(prefix)){
                 matches.add(candidate);
             }
         }
+        // 返回过滤后的结果
         return matches;
     }
 
+    /**
+     * 构造前缀的前驱和后继
+     * 将前缀的最后一个元素 替换 成第一个排在该字符前面的字符，并加上一个{（为了在多个前缀搜索同时进行时，插入多个前驱引起前驱计算错误的问题）---前驱
+     * 将前缀的最后一个元素 添加 第一个排在该字符后面的字符{（在只有a-z字符的情况下）-----后继
+     */
     private static final String VALID_CHARACTERS = "`abcdefghijklmnopqrstuvwxyz{";
     public String[] findPrefixRange(String prefix) {
+        // 找到前缀最后一个字符在VALID_CHARACTERS的位置
         int posn = VALID_CHARACTERS.indexOf(prefix.charAt(prefix.length() - 1));
         char suffix = VALID_CHARACTERS.charAt(posn > 0 ? posn - 1 : 0);
         String start = prefix.substring(0, prefix.length() - 1) + suffix + '{';
@@ -363,45 +400,76 @@ public class Chapter06 {
         return new String[]{start, end};
     }
 
+    /**
+     * 用户加入公会
+     * @param conn
+     * @param guild
+     * @param user
+     */
     public void joinGuild(Jedis conn, String guild, String user) {
         conn.zadd("members:" + guild, 0, user);
     }
 
+    /**
+     * 用户退出公会
+     * @param conn
+     * @param guild
+     * @param user
+     */
     public void leaveGuild(Jedis conn, String guild, String user) {
         conn.zrem("members:" + guild, user);
     }
 
+    /**
+     * 在redis中匹配前缀
+     * @param conn
+     * @param guild 公会ID
+     * @param prefix
+     * @return
+     */
     @SuppressWarnings("unchecked")
     public Set<String> autocompleteOnPrefix(Jedis conn, String guild, String prefix) {
+        // 计算前缀的前驱后继
         String[] range = findPrefixRange(prefix);
         String start = range[0];
         String end = range[1];
+        // 生成128位全局唯一的标识符（UUID）
         String identifier = UUID.randomUUID().toString();
+        // 防止其他用户在查询匹配的时候错误的删除前驱后继，故添加UUID
         start += identifier;
         end += identifier;
+        // 构造公会有序集合 key
         String zsetName = "members:" + guild;
 
+        // 将前驱后继添加进公会有序集合
         conn.zadd(zsetName, 0, start);
         conn.zadd(zsetName, 0, end);
 
         Set<String> items = null;
         while (true){
+            // 监视公会有序集合的变化
             conn.watch(zsetName);
+            // 获取前驱的排名
             int sindex = conn.zrank(zsetName, start).intValue();
+            // 获取后继的排名
             int eindex = conn.zrank(zsetName, end).intValue();
+            // 默认只取10个元素（去掉前驱后继）时的结果个数，即去掉前驱后继后以prefix为前缀的最后一个元素的排名
             int erange = Math.min(sindex + 9, eindex - 2);
-
+            // 开启事务
             Transaction trans = conn.multi();
+            // 将前驱后继从有序列表中移除
             trans.zrem(zsetName, start);
             trans.zrem(zsetName, end);
+            // 移除前驱后sindex就是以prefix为前缀的第一个记录的排名了
             trans.zrange(zsetName, sindex, erange);
+            // 执行事务
             List<Object> results = trans.exec();
             if (results != null){
                 items = (Set<String>)results.get(results.size() - 1);
                 break;
             }
         }
-
+        // 移除结果中带花括号的元素，移除其他自动补全操作的影响（即其他操作在本操作watch前在前驱后继中间插入了其他操作的前驱后继）
         for (Iterator<String> iterator = items.iterator(); iterator.hasNext(); ){
             if (iterator.next().indexOf('{') != -1){
                 iterator.remove();
@@ -410,14 +478,23 @@ public class Chapter06 {
         return items;
     }
 
+    /**
+     * v1.0 SETNX实现的加锁操作
+     * SETNX只会在键值不存在的情况下为键赋值
+     * @param conn
+     * @param lockName
+     * @return
+     */
     public String acquireLock(Jedis conn, String lockName) {
         return acquireLock(conn, lockName, 10000);
     }
     public String acquireLock(Jedis conn, String lockName, long acquireTimeout){
+        // 生成全局唯一标识符UUID 来为键值赋值表示获取锁
         String identifier = UUID.randomUUID().toString();
 
         long end = System.currentTimeMillis() + acquireTimeout;
         while (System.currentTimeMillis() < end){
+            // 尝试获取锁
             if (conn.setnx("lock:" + lockName, identifier) == 1){
                 return identifier;
             }
@@ -432,6 +509,15 @@ public class Chapter06 {
         return null;
     }
 
+    /**
+     * v2.0 SETNX实现的带有超时限制的加锁操作
+     * 确保锁在持有者崩溃的情况下也能自动被释放
+     * @param conn
+     * @param lockName
+     * @param acquireTimeout 加锁超时重试时限
+     * @param lockTimeout 锁的生存时间
+     * @return
+     */
     public String acquireLockWithTimeout(
         Jedis conn, String lockName, long acquireTimeout, long lockTimeout)
     {
@@ -442,10 +528,12 @@ public class Chapter06 {
         long end = System.currentTimeMillis() + acquireTimeout;
         while (System.currentTimeMillis() < end) {
             if (conn.setnx(lockKey, identifier) == 1){
+                // 获取锁成功， 并为锁设置过期时间
                 conn.expire(lockKey, lockExpire);
                 return identifier;
             }
             if (conn.ttl(lockKey) == -1) {
+               // 检查过期时间，若没有设置过期时间，则马上设置锁的过期时间
                 conn.expire(lockKey, lockExpire);
             }
 
@@ -460,14 +548,27 @@ public class Chapter06 {
         return null;
     }
 
+    /**
+     * V1.0 解锁操作
+     * @param conn
+     * @param lockName
+     * @param identifier
+     * @return
+     */
     public boolean releaseLock(Jedis conn, String lockName, String identifier) {
+        // 构造锁 key
         String lockKey = "lock:" + lockName;
 
         while (true){
+            // 监视锁的变化
             conn.watch(lockKey);
+            // 检查键目前的值是否和加锁时设的值相同，锁是否被持有
             if (identifier.equals(conn.get(lockKey))){
+                // 开始事务
                 Transaction trans = conn.multi();
+                // 删除该键，即解锁
                 trans.del(lockKey);
+                // 执行事务
                 List<Object> results = trans.exec();
                 if (results == null){
                     continue;
@@ -482,36 +583,63 @@ public class Chapter06 {
         return false;
     }
 
+    /**
+     * 实现公平信号量
+     * @param conn
+     * @param semname 超时有序集合
+     * @param limit
+     * @param timeout
+     * @return
+     */
     public String acquireFairSemaphore(
         Jedis conn, String semname, int limit, long timeout)
     {
+        /**
+         * 超时有序集合 作用：移除超时的信号量
+         * 信号量拥有者有序集合 作用：判断是否成功获取信号量
+         */
         String identifier = UUID.randomUUID().toString();
+        // 信号量拥有者 有序集合 key
         String czset = semname + ":owner";
+        // 计数器 key
         String ctr = semname + ":counter";
 
         long now = System.currentTimeMillis();
+        // 开启事务
         Transaction trans = conn.multi();
+        // ZREMRANGEBYSCORE key min max
+        // 删除过期的标识符
         trans.zremrangeByScore(
-            semname.getBytes(),
-            "-inf".getBytes(),
-            String.valueOf(now - timeout).getBytes());
+            semname.getBytes(),// key
+            "-inf".getBytes(),// min
+            String.valueOf(now - timeout).getBytes());// max
         ZParams params = new ZParams();
         params.weights(1, 0);
+        // 超时有序集合与信号量拥有者有序集合执行交集运算
         trans.zinterstore(czset, params, czset, semname);
+        // 更新计数器
         trans.incr(ctr);
         List<Object> results = trans.exec();
+        // 获取计数器当前的最大值
         int counter = ((Long)results.get(results.size() - 1)).intValue();
 
+        // 开启事务
         trans = conn.multi();
+        // 将标识符和时间戳添加进超时有序集合中
         trans.zadd(semname, now, identifier);
+        // 将标识符和从计数器获取的值添加进信号量拥有者有序集合中
         trans.zadd(czset, counter, identifier);
         trans.zrank(czset, identifier);
         results = trans.exec();
+        // 查询当前标识符在信号量拥有者有序集合中的排名
         int result = ((Long)results.get(results.size() - 1)).intValue();
         if (result < limit){
+            // 获取信号量成功， 放回标识符UUID
             return identifier;
         }
-
+        // 计数信号量和其他锁的区别在于，当客户端获取锁失败时，客户端通常会选择等待，
+        // 而当客户端获取计数信号量失败的时候，客户端通常会选择立即返回失败结果
+        // 获取信号量失败，将标识符从 超时有序集合和信号量拥有者有序集合中 删除
         trans = conn.multi();
         trans.zrem(semname, identifier);
         trans.zrem(czset, identifier);
@@ -519,9 +647,17 @@ public class Chapter06 {
         return null;
     }
 
+    /**
+     * 公平信号量释放操作
+     * @param conn
+     * @param semname
+     * @param identifier
+     * @return
+     */
     public boolean releaseFairSemaphore(
         Jedis conn, String semname, String identifier)
     {
+        // 将标识符从 超时有序集合和信号量拥有者有序集合中 删除
         Transaction trans = conn.multi();
         trans.zrem(semname, identifier);
         trans.zrem(semname + ":owner", identifier);
